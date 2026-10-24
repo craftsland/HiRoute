@@ -4,6 +4,7 @@
 import argparse
 import ctypes
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -601,38 +602,45 @@ def verify_process_identity(row: dict, item: dict, expected: dict) -> None:
 
 
 def record_started_processes(row: dict) -> list[int]:
-    members = [item for item in process_rows() if item["pgid"] == int(row["pgid"])]
+    snapshot = process_rows()
     recorded = {int(item["pid"]): item for item in row.get("process_identities", [])}
-    if not members:
-        return []
-    leader = next((item for item in members if item["pid"] == int(row["pid"])), None)
-    if leader is None:
+    exited = set()
+    for _ in range(16):
+        if any(item["pid"] in exited for item in snapshot):
+            raise ValueError("an exited PID reappeared during observation")
+        members = [item for item in snapshot if item["pgid"] == int(row["pgid"])]
+        leader = next((item for item in members if item["pid"] == int(row["pid"])), None)
+        # Prove the leader before admitting any newly observed direct child.
+        members.sort(key=lambda item: item["pid"] != int(row["pid"]))
         for item in members:
-            expected = recorded.get(item["pid"])
-            if expected is None:
-                raise ValueError(
-                    "Desktop leader disappeared with an unrecorded group member; refusing cleanup"
-                )
-            verify_process_identity(row, item, expected)
-        return [item["pid"] for item in members]
-    if leader["pid"] not in recorded:
-        identity = capture_process_identity(row, leader, "app")
-        row.setdefault("process_identities", []).append(identity)
-        recorded[leader["pid"]] = identity
-    else:
-        verify_process_identity(row, leader, recorded[leader["pid"]])
-    for item in members:
-        if item["pid"] == leader["pid"]:
-            continue
-        if item["pid"] in recorded:
-            verify_process_identity(row, item, recorded[item["pid"]])
-            continue
-        if item["ppid"] != int(row["pid"]):
-            raise ValueError("unrecorded process is not a direct child of the launched Desktop")
-        identity = capture_process_identity(row, item, "daemon")
-        row["process_identities"].append(identity)
-        recorded[item["pid"]] = identity
-    return [item["pid"] for item in members]
+            try:
+                expected = recorded.get(item["pid"])
+                if expected is not None:
+                    verify_process_identity(row, item, expected)
+                    continue
+                if leader is None:
+                    raise ValueError(
+                        "Desktop leader disappeared with an unrecorded group member; refusing cleanup"
+                    )
+                role = "app" if item["pid"] == leader["pid"] else "daemon"
+                if role == "daemon" and item["ppid"] != int(row["pid"]):
+                    raise ValueError("unrecorded process is not a direct child of the launched Desktop")
+                identity = capture_process_identity(row, item, role)
+                row.setdefault("process_identities", []).append(identity)
+                recorded[item["pid"]] = identity
+            except ProcessLookupError:
+                latest = process_rows()
+                if any(current["pid"] == item["pid"] for current in latest):
+                    raise
+                # Native startup/exit can finish between ps and libproc. Only a
+                # confirmed absent PID may be discarded; recheck all remaining
+                # members, including newcomers, before accepting this snapshot.
+                exited.add(item["pid"])
+                snapshot = latest
+                break
+        else:
+            return [item["pid"] for item in members]
+    raise ValueError("process membership did not stabilize during observation")
 
 
 def owned_process_group(row: dict, *, stopping: bool = False) -> list[int]:
@@ -715,11 +723,29 @@ def pilot_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def native_app_module():
+    spec = importlib.util.spec_from_file_location(
+        "pilot_native_app", Path(__file__).with_name("pilot-native-app.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def stop_session(session_path: Path, row: dict, timeout: float = 12.0, *, revoke=False):
+    if row.get("native_app"):
+        return native_app_module().stop(session_path, timeout=timeout, revoke=revoke)
+    return stop_group(row, timeout)
+
+
 def start(args: argparse.Namespace) -> int:
+    if getattr(args, "native_app", False) and sys.platform != "darwin":
+        raise ValueError("--native-app requires macOS LaunchServices")
     override = diagnostic_override(args.diagnostic_level)
     build = verify_managed_pilot_build(args.build_run, args.app, args.source_sha)
     if build["reuse_managed"] and not getattr(args, "managed_lease", None):
         raise ValueError("Reusable Pilot builds must start through pilot-build start with an owner lease")
+    if getattr(args, "native_app", False) and not build["reuse_managed"]:
+        raise ValueError("Native App entries require pilot-build start with an owner lease")
     app = Path(build["artifacts"]["app"]["path"])
     daemon = Path(build["artifacts"]["daemon"]["path"])
     process_home = None
@@ -748,6 +774,10 @@ def start(args: argparse.Namespace) -> int:
 
     log_path = logs / "desktop-and-daemon.log"
     log_descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if getattr(args, "native_app", False):
+        os.close(log_descriptor)
+        return native_app_module().start(
+            args, build, root, runtime, temporary, data, working, log_path, process_home)
     environment = launch_environment(runtime, temporary, data, process_home, override)
     with os.fdopen(log_descriptor, "ab", buffering=0) as output:
         process = subprocess.Popen(
@@ -845,7 +875,10 @@ def start(args: argparse.Namespace) -> int:
 
 def status(args: argparse.Namespace) -> int:
     session_path, row = read_session(args.session)
-    members = owned_process_group(row)
+    if row.get("native_app"):
+        row, members = native_app_module().observe(session_path)
+    else:
+        members = owned_process_group(row)
     socket = Path(row["socket"])
     result = {
         "state": "running" if members else "stopped",
@@ -855,6 +888,7 @@ def status(args: argparse.Namespace) -> int:
         "identifier": row["identifier"],
         "socket": str(socket),
         "socket_present": socket.exists(),
+        "native_app": row.get("native_app"),
         "processes": members,
         "log": row["log"],
         "data_root": row["data_root"],
@@ -867,8 +901,9 @@ def status(args: argparse.Namespace) -> int:
 
 def stop(args: argparse.Namespace) -> int:
     session_path, row = read_session(args.session)
-    stopped = stop_group(row, args.timeout)
-    remaining = owned_process_group(row)
+    stopped = stop_session(session_path, row, args.timeout)
+    _, row = read_session(str(session_path))
+    remaining = owned_process_group(row) if row["pid"] else []
     if remaining:
         raise RuntimeError(f"verified process group is still running after stop: {remaining}")
     result = {
@@ -923,6 +958,7 @@ def build_parser() -> argparse.ArgumentParser:
             "override so the isolated root's saved value applies"
         ),
     )
+    launch.add_argument("--native-app", action="store_true", help="create an isolated macOS App that can be reopened until lease finish")
     launch.add_argument("--timeout", type=float, default=240.0)
     launch.set_defaults(function=start)
     inspect = subparsers.add_parser("status", help="inspect one recorded session")
