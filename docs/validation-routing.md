@@ -489,12 +489,17 @@ acceptance remains a separate obligation.
 ### Reuse one retained backend checkout for product smoke
 
 For repeated validation on the same pushed SHA, first run with `--retention always`.
-After it completes, submit another command with `--reuse-checkout FIRST_RUN_ID`, the
+After it stops, submit another command with `--reuse-checkout FIRST_RUN_ID`, the
 same `--sha` and branch, and the same build-slot class. The workbench checks the owner
 run, SHA, origin, committed executor, clean worktree and Git registration before using
 its default `target/`. A checkout lease serializes reuse and prevents owner cleanup
 while a borrower runs. Borrower cleanup keeps the owner checkout; after borrowers
 finish, `backend cleanup FIRST_RUN_ID` releases it.
+
+Same-candidate reuse remains available after a non-timeout test failure, including
+when no `--plan` was supplied or the original `on-failure` owner stopped at a
+recoverable preparation block. Each retry creates a new result; the failed result
+keeps its original verdict.
 
 ```sh
 python3 scripts/validation.py backend run --ref refs/heads/codex/my-change \
@@ -522,6 +527,10 @@ and the same plan/branch. The source may advance to a descendant committed SHA;
 the runner retains the checkout's own target while validating current source and
 recording a new result. Continue only after the previous worker stops. Stale run
 IDs, dirty source, changed executor implementation and a different plan are rejected.
+The exact latest run may also be a recoverable pre-command console-assets or cache
+preflight block. Prepare the missing input or repair the cache using its diagnostic,
+then execute the generated recovery command from the same committed driver. Recovery
+creates a new run; the blocked result and all earlier source revisions remain intact.
 Cleanup belongs to the first checkout owner, after all commands finish. Keep each
 run's original SHA when citing evidence; cached artifacts are not scenario evidence.
 
@@ -621,10 +630,15 @@ a backend frontend toolchain. Do not copy files directly into a managed checkout
 The supplied staging directory remains caller-owned and may be removed after the
 run finishes. A valid retained dist is rechecked on subsequent installed runs
 without supplying `--frontend-dist` again.
-An early console-blocked checkout retained by `always` or `on-failure` can be reused
-at the same SHA/driver; its original blocked result remains unchanged. `never`
-removes the checkout, so omit reuse for the next run. Usual completed-run reuse and
-cleanup ownership still apply. The checkout owner records this setup association;
+The result's `recovery.command` uses the existing `remote-rust.py` SSH entry and
+preserves the selected host/workbench, candidate, timeout, schedule, plan, phase,
+executed related runs and Cargo arguments. For an integration checkout retained by
+`always`, it continues the latest blocked run, including after multiple source
+advances; the original owner remains responsible for cleanup. An early blocked owner
+retained by `on-failure` uses exact-candidate reuse. Both paths recheck stopped-worker,
+current-state, clean-source and driver identity under the checkout lease before
+checking the supplied assets again. `never` removes a fresh checkout, so its command
+starts a new one. Old results remain unchanged. The checkout state records resource use;
 `--related-run` accepts executed reports, so do not pass a setup-blocked run there.
 Do not replace production assets with a dummy page
 or weaken package assertions. Hosted CI retains its existing frontend artifact
