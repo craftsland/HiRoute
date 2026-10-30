@@ -215,8 +215,8 @@ pub(crate) fn project_candidate_request_template_with_cleanup(
     })
 }
 
-pub(crate) fn prepare_replay_json_template(
-    body: &impl serde::Serialize,
+pub(crate) fn prepare_replay_json_template<T: serde::Serialize + ?Sized>(
+    body: &T,
     refs: impl IntoIterator<Item = RequestedReplacement>,
 ) -> Result<PreparedReplayTemplate, ProtocolAdapterError> {
     let bytes = serde_json::to_vec(body)

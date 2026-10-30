@@ -71,6 +71,7 @@ mod collaboration_store;
 mod compute;
 pub(crate) mod current_dependencies;
 mod decision_services;
+mod decision_services_v2;
 mod journal;
 #[path = "../agents/native_artifacts.rs"]
 mod native_artifacts;
@@ -776,6 +777,7 @@ impl ControlRepositoryPort for ControlStore {
         }
         compute::management::stage_control(&transaction, workspace, operation_id, desired)?;
         decision_services::stage(&transaction, workspace, desired)?;
+        decision_services_v2::stage(&transaction, workspace, operation_id, desired)?;
 
         let desired_json = serde_json::to_string(&json!({
             "schema": "hiroute.control-desired/v1",
@@ -955,7 +957,13 @@ impl ControlRepositoryPort for ControlStore {
             staged_json.as_deref(),
             operation_id,
         )?;
-        if workspace_owned && pool_owned && source_owned && management_owned {
+        let decision_owned = decision_services_v2::current_matches(
+            &connection,
+            workspace,
+            staged_json.as_deref(),
+            operation_id,
+        )?;
+        if workspace_owned && pool_owned && source_owned && management_owned && decision_owned {
             Ok(EffectReconciliation::Applied(owned))
         } else {
             Ok(EffectReconciliation::OwnershipLost(owned))
@@ -1108,6 +1116,7 @@ impl ControlRepositoryPort for ControlStore {
             }
         }
         compute::management::activate(&transaction, &workspace, &staged, operation_id)?;
+        decision_services_v2::activate(&transaction, &workspace, &staged, operation_id)?;
         prices::activate(&transaction, &workspace, &staged)?;
         transaction
             .execute(
@@ -1232,6 +1241,9 @@ impl ControlRepositoryPort for ControlStore {
         let workspace = WorkspaceId::parse(record.0.clone())
             .map_err(|_| port(PortErrorCode::Corrupt, "control.compensate.workspace"))?;
         if !compute::management::compensate(&transaction, &workspace, operation_id)? {
+            return Ok(CompensationOutcome::OwnershipLost);
+        }
+        if !decision_services_v2::compensate(&transaction, &workspace, operation_id)? {
             return Ok(CompensationOutcome::OwnershipLost);
         }
         if !prices::compensate(&transaction, operation_id)? {
@@ -1400,7 +1412,16 @@ impl ControlRepositoryPort for ControlStore {
         operation: &OperationV1,
         references: &[hiroute_domain::CredentialRefV1],
     ) -> PortResult<()> {
-        compute::management::reconcile_compensation(self, operation, references)
+        if operation
+            .plan
+            .control()
+            .get("decision_service_operation_v2")
+            .is_some()
+        {
+            decision_services_v2::reconcile_compensation(self, operation, references)
+        } else {
+            compute::management::reconcile_compensation(self, operation, references)
+        }
     }
 
     fn finish_operation(&self, operation: &mut OperationV1) -> PortResult<u64> {
@@ -1419,6 +1440,7 @@ impl ControlRepositoryPort for ControlStore {
         plans::finish_plan_operation(&transaction, operation)
             .map_err(|_| port(PortErrorCode::Conflict, "control.finish.plan-head"))?;
         decision_services::finish(&transaction, operation)?;
+        decision_services_v2::finish(&transaction, operation)?;
         compute::finish_save_handoff_in(&transaction, operation)?;
         artifact_heads::finish(
             &transaction,
